@@ -2,7 +2,7 @@
 
 Aether (extensions `.ae`, `.aeth`) is a systems programming language whose V1 compiles
 to x86-64 assembly. Syntax is **modern** (Rust/Go-like) but semantics stay close to the
-machine. V1 compiler is **external** (Perl); bootstrapping (a compiler written in Aether)
+machine. V1 compiler is written in x86-64 assembly (NASM); bootstrapping (a compiler written in Aether)
 begins at **V2**. All compiler source lives in `.ae`/`.aeth` from V2 onward.
 
 ---
@@ -24,8 +24,8 @@ Layout:
 ```
 project/
   aether.toml
-  src/main.ae
-  src/lexer.ae        # V2 compiler modules (Aether source)
+  src/main.asm        # V1 compiler (NASM) -- bootstraps V2
+  src/v2/main.ae      # V2 compiler (Aether, self-hosted)
   lib/math.aeth
   build/
 ```
@@ -35,8 +35,9 @@ Manifest `aether.toml`:
 ```
 name = "aetherc"
 version = "2.0.0"
-entry = "src/main.ae"
-modules = ["src/lexer.ae", "src/parser.ae"]
+entry_asm = "src/main.asm"  # V1
+entry     = "src/v2/main.ae"  # V2 (compiled by V1)
+modules = ["src/v2/lexer.ae", "src/v2/parser.ae"]
 ```
 
 ## 3. Lexical Grammar
@@ -119,7 +120,7 @@ asm {
 
 ## 6. Algorithms (Compiler Pipeline, V1 external)
 
-1. CLI parse args (`aetherc <inputs> -o out [--emit-asm|--emit-obj] -I path -v`).
+1. CLI parse args (`aetherc <inputs> -o out [--emit-asm|--emit-obj] -I path -v`). V1 binary is built from src/main.asm.
 2. Preprocess: resolve `use`/`import` graph, include textual `include` if any (V1 keeps `use`).
 3. Lex -> tokens with positions.
 4. Parse -> AST.
@@ -133,7 +134,7 @@ asm {
 8. Assemble & link: `nasm -f elf64`, `ld`.
 9. Report diagnostics; atomic output write.
 
-Two passes over AST: symbols then codegen. V1 compiler is Perl (`aetherc.pl`).
+Two passes over AST: symbols then codegen. V1 compiler is assembly (`src/main.asm`).
 
 ## 7. Multi-File / Splitting
 
@@ -146,7 +147,7 @@ Two passes over AST: symbols then codegen. V1 compiler is Perl (`aetherc.pl`).
 
 ## 8. Compiler Responsibilities (V1, external)
 
-- Implement §6 in Perl (or any host language) producing NASM.
+- Implement §6 in x86-64 assembly (NASM), producing NASM then invoking nasm+ld.
 - Toolchain invocation and error propagation.
 - Diagnostics format §9.
 - Exit codes: 0 ok, 1 compile error, 2 usage, 3 toolchain/internal.
@@ -179,8 +180,8 @@ emit partial output (temp + rename).
 
 ## 10. Bootstrapping (starts at V2)
 
-- **V1**: compiler is external (Perl `aetherc.pl`). Source tree may already use `.ae`
-  for examples, but the compiler itself is NOT Aether.
+- **V1**: compiler is written in x86-64 assembly (NASM), source `src/main.asm`.
+  It compiles Aether (`.ae`/`.aeth`) to NASM and links. No Aether compiler exists yet.
 - **V2**: compiler is rewritten in Aether (`.ae`/`.aeth` under `src/`). Bootstrapping
   begins here: V1 compiles V2 compiler source -> `aetherc` binary; then V2 compiles
   itself (self-host). V1 must support all features used by the V2 compiler source.

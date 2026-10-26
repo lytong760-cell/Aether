@@ -1,0 +1,6 @@
+// src/v2/main.ae -- Aether V2 compiler (self-hosted, compiled by V1)
+module aetherc::v2
+
+fn main() -> i32 {
+    return 0
+}
