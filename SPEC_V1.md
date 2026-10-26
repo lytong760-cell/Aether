@@ -1,203 +1,215 @@
 # Aether Language Specification — V1 (SPEC_V1)
 
-Aether (extensions `.ae`, `.aeth`) is a low-level programming language built directly on
-x86-64 assembly concepts. V1 is a **bootstrap compiler**: it is implemented outside of
-Aether (in Perl) and lowers Aether source to NASM assembly, then invokes `nasm` + `ld`.
+Aether (extensions `.ae`, `.aeth`) is a systems programming language whose V1 compiles
+to x86-64 assembly. Syntax is **modern** (Rust/Go-like) but semantics stay close to the
+machine. V1 compiler is **external** (Perl); bootstrapping (a compiler written in Aether)
+begins at **V2**. All compiler source lives in `.ae`/`.aeth` from V2 onward.
 
 ---
 
-## 1. Goals and Non-Goals
+## 1. Goals / Non-Goals
 
-- **Goals**: readable assembly-level syntax, multi-file projects, modules, macros, clear
-  diagnostics, deterministic builds.
-- **Non-goals (V1)**: optimization, type system, high-level control flow beyond macros,
-  cross-architecture (x86-64 Linux only), debugger integration.
+- Goals: modern readable syntax, deterministic lowering to assembly, multi-file modules,
+  clear diagnostics, self-hosting path (V2).
+- Non-goals (V1): optimization, generics, closures, runtime/stdlib, non-x86-64.
 
 ## 2. File Structure
 
-| Extension | Role |
-|-----------|------|
-| `.ae`     | Application/module source. May define an entry point (`_start` or `main`). |
-| `.aeth`   | Library/module source. No entry point; exports symbols. |
+| Ext | Role |
+|-----|------|
+| `.ae`   | Module/application source (may contain `main`). |
+| `.aeth` | Library source (no `main`; exports symbols). |
 
-Project layout (recommended):
+Layout:
 ```
 project/
-  aether.toml          # manifest (optional in V1)
-  src/
-    main.ae
-  lib/
-    math.aeth
+  aether.toml
+  src/main.ae
+  src/lexer.ae        # V2 compiler modules (Aether source)
+  lib/math.aeth
   build/
-    *.asm *.o a.out
 ```
+Encoding UTF-8, LF, one statement per line (braces may span lines). Files end with newline.
 
-Encoding: UTF-8. Line endings: LF (CRLF accepted, normalized). One statement per line.
-Indentation is cosmetic (spaces/tabs). Files must end with a newline.
-
-Manifest `aether.toml` (optional):
+Manifest `aether.toml`:
 ```
-name = "demo"
+name = "aetherc"
+version = "2.0.0"
 entry = "src/main.ae"
-modules = ["lib/math.aeth"]
+modules = ["src/lexer.ae", "src/parser.ae"]
 ```
 
 ## 3. Lexical Grammar
 
-- Comments: `;` to end of line. Block comments `/* ... */` (may not nest).
+- Comments: `//` line, `/* */` block (non-nesting).
 - Identifiers: `[A-Za-z_][A-Za-z0-9_]*`. Case-sensitive.
-- Labels: identifier followed by `:` at statement start (or `name:` anywhere a label is valid).
-- Numbers: `42` (dec), `0x2A`, `0b101010`, `0o52`. Suffixes: `h`/`b`/`o`/`d` optional.
-- Chars: `'a'`, `'\n'`, `'\0'`.
-- Strings: `"..."` with escapes `\n \t \r \\ \" \0 \xHH`.
-- Registers: `rax rbx rcx rdx rsi rdi rbp rsp r8..r15` and 32/16/8-bit aliases.
-- Keywords/directives are case-insensitive for directives, case-sensitive for identifiers? V1: directives case-insensitive.
+- Numbers: `42`, `0x2A`, `0b1010`, `0o52`. Suffix `_u8/_u64/_i32` optional.
+- Char: `'a'`, `'\n'`. String: `"..."` with escapes.
+- Keywords (reserved):
+  `module use pub fn let var const struct enum if else while for in return
+   break continue asm extern import export unsafe sizeof typeof`
+- Operators: `+ - * / % & | ^ ~ << >> == != < > <= >= && || ! = += -= *= /=`
+  `-> :: . , ; : ( ) { } [ ]`
+- Attributes: `#[...]` (e.g. `#[no_mangle]`, `#[entry]`).
 
-Operators: `+ - * / % & | ^ ~ << >> = == != < > <= >=` (used in `equ`/macro exprs).
-
-## 4. Syntax (EBNF-ish)
+## 4. Syntax (EBNF)
 
 ```
-file        := (module_decl)? (import)* (section)*
-module_decl := "module" IDENT
-import      := "import" IDENT ("as" IDENT)? "from" STRING
-            | "include" STRING
+file        := module_decl? use* item*
+module_decl := "module" path
+use         := "use" path ("as" IDENT)? ("{" ident_list "}")?
+path        := IDENT ("::" IDENT)*
 
-section     := "section" SECTION_NAME stmt_list
-SECTION_NAME:= ".text" | ".data" | ".bss" | ".rodata"
+item        := fn | struct | enum | const | extern_fn | asm_block | global
 
-stmt        := label | directive | instruction | proc_block | macro_block | data_decl
+fn          := ("pub")? "fn" IDENT "(" params ")" ("->" type)? block
+params      := (IDENT ":" type ("," IDENT ":" type)*)?
+struct      := "struct" IDENT "{" (IDENT ":" type (",")?)* "}"
+enum        := "enum" IDENT "{" (IDENT ("=" expr)? (",")?)* "}"
+const       := "const" IDENT ":" type "=" expr
+extern_fn   := "extern" "fn" IDENT "(" params ")" ("->" type)?
+global      := "global" IDENT ":" type ("=" expr)?
 
-directive   := "global" IDENT
-            | "extern" IDENT
-            | "equ" IDENT "," expr          # IDENT equ expr  (also IDENT equ expr)
-            | "align" NUMBER
+block       := "{" stmt* "}"
+stmt        := let_stmt | var_stmt | assign | if_stmt | while_stmt | for_stmt
+            | return_stmt | break | continue | expr_stmt | asm_block
 
-proc_block  := "proc" IDENT (":" params?) stmt_list "endp"
-macro_block := "macro" IDENT params? stmt_list "endm"
+let_stmt    := "let" IDENT (":" type)? "=" expr
+var_stmt    := "var" IDENT (":" type)? ("=" expr)?
+assign      := lvalue ("=" | "+=" | "-=" | "*=" | "/=") expr
+if_stmt     := "if" expr block ("else" (if_stmt | block))?
+while_stmt  := "while" expr block
+for_stmt    := "for" IDENT "in" expr ".." expr block
+return_stmt := "return" expr?
+expr_stmt   := expr
 
-data_decl   := IDENT? ("db"|"dw"|"dd"|"dq"|"resb"|"resw"|"resd"|"resq") (expr ("," expr)*)?
+asm_block   := "asm" "{" asm_stmt* "}"
+asm_stmt    := raw assembly line (mnemonic + operands)   # passthrough to codegen
 
-instruction := MNEMONIC (operand ("," operand)*)?
-operand     := register | identifier | number | char | string
-            | "[" expr ("," scale?) "]"     # memory reference
-            | "rel" operand
+type        := "u8"|"u16"|"u32"|"u64"|"i8"|"i16"|"i32"|"i64"
+            | "bool"|"void"|"ptr" type? | IDENT (struct/enum) | "[" type ";" NUMBER "]"
 
-expr        := standard arithmetic/precedence expression over numbers, idents, $, $$
+expr        := literals | IDENT | path | call | unary | binary | field | index | addr | cast
+call        := expr "(" (expr ("," expr)*)? ")"
+field       := expr "." IDENT
+index       := expr "[" expr "]"
+addr        := "&" expr
+cast        := expr "as" type
 ```
 
-Notes:
-- `proc name:` and `proc name` both accepted; colon optional after name.
-- Labels may be local (`.name`) scoped to nearest global label.
-- `$$` = current section base, `$` = current offset.
+Inline assembly example:
+```
+asm {
+    mov rax, 1
+    syscall
+}
+```
 
 ## 5. Semantics / Execution Model
 
-- Target: x86-64 System V AMD64 ABI, Linux syscalls.
-- Calling convention: args in `rdi rsi rdx rcx r8 r9`, return in `rax`, caller-saved
-  `rax rcx rdx rsi rdi r8-r11`, callee-saved `rbx rbp r12-r15`.
-- Stack: 16-byte aligned before `call`.
-- No runtime; programs are freestanding. Entry symbol `_start` (or `main` if using libc,
-  V1 default freestanding `_start`).
-- Memory sections map to ELF sections via NASM.
+- Target: x86-64 System V AMD64 ABI, Linux. Freestanding by default (`_start`).
+- Types map to sizes; `ptr` = u64. No implicit conversions except integer widening in
+  `as`.
+- Calling convention per §5 of V0 (args rdi rsi rdx rcx r8 r9, ret rax).
+- `main`/`_start`: if `fn main()` present and `#[entry]`, compiler generates `_start`
+  calling `main()` then `exit`.
+- Memory: arrays are value types stored inline; `&` takes address; indexing bounds are
+  NOT checked (V1).
+- `asm` blocks are verbatim inserted; compiler does not validate registers inside.
 
-## 6. Algorithms (Compiler Pipeline)
+## 6. Algorithms (Compiler Pipeline, V1 external)
 
-1. **CLI parse**: validate args, determine input files, output path.
-2. **Preprocess** (per file):
-   - Resolve `include` (textual, with include-guard via `#pragma once`-like `once`).
-   - Expand `macro` definitions (textual substitution with parameters).
-   - Remove comments.
-3. **Lex**: produce token stream with positions (file, line, col).
-4. **Parse**: build AST (list of sections/statements).
-5. **Semantic analysis**:
-   - Build global symbol table (labels, procs, data, equ).
-   - Resolve `import`/`extern` against exported symbols of other modules.
-   - Validate instruction mnemonics against allowed table (subset of x86-64).
-   - Check label uniqueness within scope; section placement rules.
-   - Compute `equ` expressions (constant folding, V1: only constants and `$`).
-6. **Codegen**: emit NASM source (`.asm`) preserving sections, labels, instructions.
-   - Imports become `extern`; exports become `global`.
-7. **Assemble & link**: `nasm -f elf64` then `ld` (or `gcc` if libc requested).
-8. **Report**: diagnostics, timing, output path.
+1. CLI parse args (`aetherc <inputs> -o out [--emit-asm|--emit-obj] -I path -v`).
+2. Preprocess: resolve `use`/`import` graph, include textual `include` if any (V1 keeps `use`).
+3. Lex -> tokens with positions.
+4. Parse -> AST.
+5. Semantic:
+   - Symbol table (functions, structs, consts, globals).
+   - Type check expressions (minimal: size + signedness).
+   - Resolve modules; detect cycles (E020).
+   - Monomorphization: none (V1).
+6. Lowering: AST -> Aether-IR (simple three-address) -> x86-64 instructions.
+7. Codegen: emit NASM `.asm` (or object via nasm).
+8. Assemble & link: `nasm -f elf64`, `ld`.
+9. Report diagnostics; atomic output write.
 
-Single-pass where possible; semantic pass requires two passes (symbols then codegen).
+Two passes over AST: symbols then codegen. V1 compiler is Perl (`aetherc.pl`).
 
 ## 7. Multi-File / Splitting
 
-- Each `.ae`/`.aeth` is one module. Module name = file basename unless `module` declared.
-- `import foo from "path.aeth"` brings exported symbol `foo` into current scope.
-- `include "path"` performs textual inclusion (no new scope).
-- Build collects all reachable modules starting from entry; compiles each to `.o`;
-  links together.
-- A `.aeth` without `global`/exported symbols is allowed (internal helpers) but
-  warns `W001 unused module`.
-- Circular imports are an error `E020`.
+- Each file is a module. `module a::b` sets path; file path is hint only.
+- `use a::b` / `use a::b::{x, y}` imports.
+- `pub` controls export. Non-pub items are module-private.
+- Build starts at entry module, collects reachable modules, compiles each to `.o`,
+  links.
+- Circular module deps -> E020.
 
-## 8. Compiler Responsibilities (V1)
+## 8. Compiler Responsibilities (V1, external)
 
-- Parse & validate syntax.
-- Manage symbol tables across modules.
-- Emit valid NASM.
-- Invoke toolchain (`nasm`, `ld`) and propagate failures.
-- Produce diagnostics in the format in §9.
-- Support `--emit-asm`, `--emit-obj`, `-o`, `-I includepath`, `-v`.
-- Exit codes: `0` ok, `1` compile error, `2` usage/args, `3` toolchain/internal.
+- Implement §6 in Perl (or any host language) producing NASM.
+- Toolchain invocation and error propagation.
+- Diagnostics format §9.
+- Exit codes: 0 ok, 1 compile error, 2 usage, 3 toolchain/internal.
 
 ## 9. Error Handling & Messages
 
-Format (one line, machine-parseable):
+Format:
 ```
-file.ae:12:5: error[E003]: unknown mnemonic 'movv'
-  hint: did you mean 'mov'?
+src/lexer.ae:42:7: error[E003]: unknown identifier `tokn`
+  hint: did you mean `token`?
+  note: declared in src/token.ae:10
 ```
-Warnings: `warning[W001]: ...`. Notes: `note: ...`.
+Codes:
+- E001 unexpected token
+- E002 unterminated string/char
+- E003 unknown identifier
+- E004 type mismatch
+- E005 undefined symbol
+- E006 duplicate symbol
+- E007 invalid module path / cycle (E020 for cycle specifically)
+- E008 bad number literal
+- E009 arity mismatch
+- E010 module not found
+- E020 circular dependency
+- E030 toolchain failure
+- E099 internal compiler error
 
-Error codes:
-- `E001` unexpected token
-- `E002` unterminated string/char
-- `E003` unknown mnemonic
-- `E004` invalid operand for mnemonic
-- `E005` undefined symbol
-- `E006` duplicate symbol
-- `E007` invalid section
-- `E008` bad number literal
-- `E009` macro arity mismatch
-- `E010` include not found
-- `E020` circular import
-- `E030` toolchain failure (nasm/ld)
-- `E099` internal compiler error
+Recovery: skip to next statement on error; skip to next item on item error; never
+emit partial output (temp + rename).
 
-Recovery: on a statement error, skip to next newline; on a section error, skip to next
-section; never emit partial output file (atomic write to temp then rename).
+## 10. Bootstrapping (starts at V2)
 
-## 10. Bootstrapping
-
-- V1 compiler is implemented in Perl (see `aetherc.pl`) and depends on `nasm`+`ld`.
-- V1's job is to be correct enough to compile a V2 compiler written in Aether.
-- V2 (future) is self-hosted; out of scope for SPEC_V1.
+- **V1**: compiler is external (Perl `aetherc.pl`). Source tree may already use `.ae`
+  for examples, but the compiler itself is NOT Aether.
+- **V2**: compiler is rewritten in Aether (`.ae`/`.aeth` under `src/`). Bootstrapping
+  begins here: V1 compiles V2 compiler source -> `aetherc` binary; then V2 compiles
+  itself (self-host). V1 must support all features used by the V2 compiler source.
+- Requirement: V1 feature set must be sufficient to express a lexer/parser/codegen.
+  This constrains V1 to include: modules, structs, enums, arrays, pointers, inline asm,
+  file I/O via syscalls.
 
 ## 11. Minimal Example
 
 `hello.ae`:
 ```
-section .data
-    msg db "Hello, Aether!", 10
-    len equ $ - msg
+module hello
 
-section .text
-    global _start
+fn main() -> i32 {
+    // write syscall
+    unsafe {
+        asm {
+            mov rax, 1
+            mov rdi, 1
+            lea rsi, [msg]
+            mov rdx, 14
+            syscall
+        }
+    }
+    return 0
+}
 
-_start:
-    mov rax, 1
-    mov rdi, 1
-    lea rsi, [msg]
-    mov rdx, len
-    syscall
-
-    mov rax, 60
-    xor rdi, rdi
-    syscall
+// data in asm block at module top is not allowed; use global + addr instead
+global msg: [u8; 14] = "Hello, Aether!"
 ```
 Build: `aetherc hello.ae -o hello && ./hello`
 
